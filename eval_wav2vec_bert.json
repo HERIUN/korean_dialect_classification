@@ -1,0 +1,42 @@
+{
+    "model_name_or_path": "HERIUN/wav2vec-bert-korean-dialect-recognition",
+    "config_name": "",
+    "cache_dir": null,
+    "model_revision": "main",
+    "attention_mask":true,
+    "fp16":true,
+    "load_best_model_at_end":true,
+    "freeze_feature_encoder":true,
+    "push_to_hub":true,
+
+    "do_train": false,
+    "do_eval":true,
+    "train_file": "sampled_train_150k_fast2.csv",
+    "eval_file": "sampled_test_30k.csv",
+    "audio_column_name":"audio",
+    "label_column_name":"dialect",
+    "max_length_seconds": 20,
+
+    "dataloader_num_workers": 8,
+    "ddp_backend":"nccl",
+
+
+    "output_dir": "./wav2vec-bert-korean-dialect-recognition",
+    "remove_unused_columns":false,
+    "overwrite_output_dir": false,
+    "num_train_epochs":10,
+    "per_device_train_batch_size": 8,
+    "per_device_eval_batch_size": 16,
+    "learning_rate": 5e-5,
+    "weight_decay": 0.01,
+    "warmup_steps": 500,
+    "logging_steps": 100,
+    "eval_strategy": "steps",
+    "eval_steps":5000,
+    "save_strategy": "steps",
+    "save_steps":5000,
+    "logging_strategy": "steps",
+    "seed": 42,
+    "save_total_limit":3
+
+}

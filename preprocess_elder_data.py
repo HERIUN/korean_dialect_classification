@@ -19,7 +19,7 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("elder_preprocess.log", encoding="utf-8"),
+        logging.FileHandler("logs/elder_preprocess.log", encoding="utf-8"),
         #logging.StreamHandler()  # 콘솔에도 출력하고 싶다면
     ],
     force=True

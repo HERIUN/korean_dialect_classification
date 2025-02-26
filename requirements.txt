@@ -1,0 +1,16 @@
+datasets==2.18.0
+evaluate==0.4.3
+gradio==5.18.0
+huggingface_hub==0.29.1
+librosa==0.10.2.post1
+numpy==2.2.3
+packaging==24.2
+pandas==2.2.3
+pydub==0.25.1
+Requests==2.32.3
+scikit_learn==1.6.1
+torch==2.2.1
+torchaudio==2.2.1
+tqdm==4.67.1
+transformers==4.47.1
+yt_dlp==2025.2.19

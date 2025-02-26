@@ -56,3 +56,18 @@ def get_sorted_wav_files_with_cache(raw_path, cache_file="wav_cache.pkl", cache_
 # sorted_wav_files = get_sorted_wav_files_with_cache(path_info["raw_path"])
 # for wav in sorted_wav_files:
 #     print(wav)
+
+
+def get_label_weight(counts, label_list):
+    import torch
+    max_count = max(counts.values())
+
+    class_weights = []
+    for label in label_list:
+        count = counts[label]
+        weight = max_count / count  # 예: 최대 등장 횟수 / 현재 라벨 등장 횟수
+        class_weights.append(weight)
+
+    class_weights = torch.tensor(class_weights, dtype=torch.float)
+    print("class_weights:", class_weights)
+    return class_weights

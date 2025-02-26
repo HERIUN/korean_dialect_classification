@@ -17,11 +17,12 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     handlers=[
-        logging.FileHandler("process2.log", encoding="utf-8"),
+        logging.FileHandler("logs/process2.log", encoding="utf-8"),
         logging.StreamHandler()  # 콘솔에도 출력하고 싶다면
     ]
 )
 logger = logging.getLogger(__name__)
+root_dir = "/data/donggukang/data" # downloaded data root folder
 
 def get_sorted_wav_files(root_directory, label):
     cache_file = f"{label}_cache.pickle"
@@ -62,7 +63,6 @@ def get_sorted_metadata_files(root_directory, label):
         pickle.dump(files, f)
     return files
 
-root_dir = "/data/donggukang/data"
 
 paths = {
     "Gyeongsang-do": {

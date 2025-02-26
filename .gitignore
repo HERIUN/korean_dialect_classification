@@ -1,0 +1,13 @@
+__pycache__
+.vscode
+cache
+logs
+wandb
+*.csv
+tmp
+.gradio
+*.wav
+.env
+
+# train result
+wav2vec-bert-korean-dialect-recognition

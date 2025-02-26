@@ -1,3 +1,4 @@
+#ref : https://github.com/huggingface/transformers/blob/main/examples/pytorch/audio-classification/run_audio_classification.py
 import logging
 import os
 import sys
@@ -10,8 +11,10 @@ import datasets
 import evaluate
 import numpy as np
 from datasets import DatasetDict, load_dataset
+from huggingface_hub import login
 
 import torch.distributed as dist
+from collections import Counter
 
 import transformers
 from transformers import (
@@ -26,22 +29,25 @@ from transformers import (
 )
 from transformers.trainer_utils import get_last_checkpoint
 from transformers.utils import check_min_version, send_example_telemetry
-from transformers.utils.versions import require_version
 import librosa
 import wandb
-wandb.login(key="960581c06e2f0c03e201502205763c7fa3843f75")
-wandb.init(
-    project="wav2vec2_bert_cls",
-    entity="ehdrndd"   # ← 개인 계정 아이디로 교체
-)
+from utils import get_label_weight
+from torch.nn.modules.loss import CrossEntropyLoss
+import torch
+from dotenv import load_dotenv
 
+load_dotenv()
+token = os.environ["HF_TOKEN"]
+
+logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        handlers=[
+            logging.StreamHandler(sys.stdout),
+            logging.FileHandler("korean_dialect_classification", mode="a", encoding="utf-8")
+        ],
+    )
 logger = logging.getLogger(__name__)
-
-# Will error if the minimal version of Transformers is not installed. Remove at your own risks.
-# check_min_version("4.48.0.dev0")
-
-#require_version("datasets>=1.14.0", "To fix: pip install -r examples/pytorch/audio-classification/requirements.txt")
-
 
 def random_subsample(wav: np.ndarray, max_length: float, sample_rate: int = 16000):
     """Randomly sample chunks of `max_length` seconds from the input audio"""
@@ -50,6 +56,74 @@ def random_subsample(wav: np.ndarray, max_length: float, sample_rate: int = 1600
         return wav
     random_offset = randint(0, len(wav) - sample_length - 1)
     return wav[random_offset : random_offset + sample_length]
+
+def load_checkpoint_safely(checkpoint_path, device="cuda"):
+    """Load checkpoint safely, even if GPU count has changed."""
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")  # Always load to CPU first
+    
+    # Check if the checkpoint has CUDA RNG states
+    if "cuda" in checkpoint.get("rng_state", {}):
+        checkpoint_rng_state = checkpoint["rng_state"]["cuda"]
+        num_gpus_checkpoint = len(checkpoint_rng_state)
+        num_gpus_current = torch.cuda.device_count()
+        
+        if num_gpus_checkpoint != num_gpus_current:
+            print(f"[WARNING] GPU count mismatch! Checkpoint has {num_gpus_checkpoint} GPUs, but current system has {num_gpus_current} GPUs.")
+            
+            # Adjust the RNG state size
+            adjusted_rng_state = [checkpoint_rng_state[i % num_gpus_checkpoint] for i in range(num_gpus_current)]
+            checkpoint["rng_state"]["cuda"] = adjusted_rng_state
+    
+    return checkpoint
+
+accuracy_metric = evaluate.load("accuracy")
+precision_metric = evaluate.load("precision")
+recall_metric = evaluate.load("recall")
+f1_metric = evaluate.load("f1")
+# Define our compute_metrics function. It takes an `EvalPrediction` object (a namedtuple with
+# `predictions` and `label_ids` fields) and has to return a dictionary string to float.
+def compute_metrics(eval_pred):
+    """Computes accuracy, precision, recall, f1 for multiclass predictions"""
+    predictions = np.argmax(eval_pred.predictions, axis=1)
+    references = eval_pred.label_ids
+    
+    # 1) Accuracy
+    accuracy_result = accuracy_metric.compute(predictions=predictions, references=references)
+    
+    # 2) Precision
+    precision_result = precision_metric.compute(
+        predictions=predictions, 
+        references=references, 
+        average="macro",  # or "weighted",
+        zero_division=0
+    )
+    
+    # 3) Recall
+    recall_result = recall_metric.compute(
+        predictions=predictions, 
+        references=references, 
+        average="macro",
+        zero_division=0
+    )
+    
+    # 4) F1
+    f1_result = f1_metric.compute(
+        predictions=predictions, 
+        references=references, 
+        average="macro",
+    )
+    
+    return {
+        "accuracy": accuracy_result["accuracy"],
+        "precision": precision_result["precision"],
+        "recall": recall_result["recall"],
+        "f1": f1_result["f1"]
+    }
+
+
+def speech_file_to_array_fn(path):
+    y, sr = librosa.load(path, sr=16000)
+    return y
 
 
 @dataclass
@@ -163,51 +237,21 @@ class ModelArguments:
             )
         },
     )
-    freeze_feature_extractor: Optional[bool] = field(
-        default=None, metadata={"help": "Whether to freeze the feature extractor layers of the model."}
-    )
     ignore_mismatched_sizes: bool = field(
         default=False,
         metadata={"help": "Will enable to load a pretrained model whose head dimensions are different."},
     )
 
-    def __post_init__(self):
-        if not self.freeze_feature_extractor and self.freeze_feature_encoder:
-            warnings.warn(
-                "The argument `--freeze_feature_extractor` is deprecated and "
-                "will be removed in a future version. Use `--freeze_feature_encoder` "
-                "instead. Setting `freeze_feature_encoder==True`.",
-                FutureWarning,
-            )
-        if self.freeze_feature_extractor and not self.freeze_feature_encoder:
-            raise ValueError(
-                "The argument `--freeze_feature_extractor` is deprecated and "
-                "should not be used in combination with `--freeze_feature_encoder`. "
-                "Only make use of `--freeze_feature_encoder`."
-            )
-
-
-def speech_file_to_array_fn(path):
-    y, sr = librosa.load(path, sr=16000)
-    return y
-
-label_list = [
-    "Gyeongsang-do",
-    "Jeolla-do",
-    "Chungcheong-do",
-    "Jeju-do",
-    "Gangwon-do",
-    "Seoul_Gyeonggi-do"
-]
-
 
 def main():
-    # dist.init_process_group(
-    #     backend='nccl',  # or 'gloo' for CPU-only training
-    #     init_method='env://',  # or a custom URL for initialization
-    #     world_size=4,  # Total number of processes
-    #     rank=0  # Rank of this process
-    # )
+    label_list = [
+        "Gyeongsang-do",
+        "Jeolla-do",
+        "Chungcheong-do",
+        "Jeju-do",
+        "Gangwon-do",
+        "Seoul_Gyeonggi-do"
+    ]
     parser = HfArgumentParser((ModelArguments, DataTrainingArguments, TrainingArguments))
     if len(sys.argv) == 2 and sys.argv[1].endswith(".json"):
         # If we pass only one argument to the script and it's the path to a json file,
@@ -216,27 +260,33 @@ def main():
     else:
         model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    model_args.token = token
+    
+    if training_args.local_rank in [-1, 0]:
+        wandb.init(
+            project="wav2vec2_bert_cls",
+            entity="ehdrndd",
+            resume="auto" if training_args.do_train else "allow",  # 이전 실행이 있으면 이어서 실행. auto로 하면, run id도 기존에 쓰던걸 씀.
+        )
+    else:
+        # 나머지 프로세스는 disabled 모드로 돌려두면 실제 W&B 로그가 생기지 않음
+        wandb.init(mode="disabled")
+
+    
+    login(token=model_args.token)
+    training_args.token = model_args.token
     # Sending telemetry. Tracking the example usage helps us better allocate resources to maintain them. The
     # information sent is the one passed as arguments along with your Python/PyTorch versions.
     send_example_telemetry("run_audio_classification", model_args, data_args)
 
-    # Setup logging
-    logging.basicConfig(
-        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
-        datefmt="%m/%d/%Y %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
-    )
-
     if training_args.should_log:
         # The default of training_args.log_level is passive, so we set log level at info here to have that default.
         transformers.utils.logging.set_verbosity_info()
-    training_args.token = model_args.token
-
-    log_level = training_args.get_process_log_level()
-    logger.setLevel(log_level)
-    transformers.utils.logging.set_verbosity(log_level)
-    transformers.utils.logging.enable_default_handler()
-    transformers.utils.logging.enable_explicit_format()
+        log_level = training_args.get_process_log_level()
+        logger.setLevel(log_level)
+        transformers.utils.logging.set_verbosity(log_level)
+        transformers.utils.logging.enable_default_handler()
+        transformers.utils.logging.enable_explicit_format()
 
     # Log on each process the small summary:
     logger.warning(
@@ -263,8 +313,6 @@ def main():
                 "the `--output_dir` or add `--overwrite_output_dir` to train from scratch."
             )
 
-    # Initialize our dataset and prepare it for the audio classification task.
-
     feature_extractor = AutoFeatureExtractor.from_pretrained(
         model_args.feature_extractor_name or model_args.model_name_or_path,
         return_attention_mask=model_args.attention_mask,  # Setting `return_attention_mask=True` is the way to get a correctly masked mean-pooling over
@@ -279,57 +327,43 @@ def main():
         "train": data_args.train_file, 
         "eval": data_args.eval_file,
     }
-    raw_datasets = load_dataset("csv", data_files=data_files, delimiter=",", )
-
-    # raw_datasets2 = DatasetDict()
-    # raw_datasets2["train"] = raw_datasets["train"].select(range(100))
-    # raw_datasets2["eval"] = raw_datasets["eval"].select(range(50))
-
-    # raw_datasets2["train"] = raw_datasets2["train"].map(
-    #     preprocess_function, 
-    #     remove_columns=["dialect", "path", "name"],
-    #     batched=True, 
-    #     batch_size=100, 
-    #     num_proc=1)
-    # raw_datasets2["eval"] = raw_datasets2["eval"].map(preprocess_val_function, remove_columns=["dialect", "path", "name"], batched=True, batch_size=100, num_proc=1)
-    # raw_datasets2 = raw_datasets
-
-    # if data_args.audio_column_name not in raw_datasets["train"].column_names:
-    #     raise ValueError(
-    #         f"--audio_column_name {data_args.audio_column_name} not found in dataset '{data_args.dataset_name}'. "
-    #         "Make sure to set `--audio_column_name` to the correct audio column - one of "
-    #         f"{', '.join(raw_datasets['train'].column_names)}."
-    #     )
-
-    # if data_args.label_column_name not in raw_datasets["train"].column_names:
-    #     raise ValueError(
-    #         f"--label_column_name {data_args.label_column_name} not found in dataset '{data_args.dataset_name}'. "
-    #         "Make sure to set `--label_column_name` to the correct text column - one of "
-    #         f"{', '.join(raw_datasets['train'].column_names)}."
-    #     )
-
-
-    # `datasets` takes care of automatically loading and resampling the audio,
-    # so we just need to set the correct target sampling rate.
-    # raw_datasets = raw_datasets.cast_column(
-    #     data_args.audio_column_name, datasets.features.Audio(sampling_rate=feature_extractor.sampling_rate)
-    # )
-
+    logger.info("loading dataset")
+    if training_args.local_rank <= 0:
+        raw_datasets = load_dataset("csv", data_files=data_files, delimiter=",")
+    if training_args.parallel_mode.value == 'distributed':
+        dist.barrier()
+        if training_args.local_rank > 0:
+            # 다시 한 번 load_dataset을 호출하거나, 이미 캐싱된 상태라면 캐시에서 불러옵니다.
+            raw_datasets = load_dataset("csv", data_files=data_files, delimiter=",")
+    logger.info("loading dataset done")
+    
     def train_transforms(batch):
-        """Apply train_transforms across a batch."""
+        """Apply train_transforms across a batch. sample random part of audio"""
         subsampled_wavs = []
         input_column = "path"
-        audio_arrays = [speech_file_to_array_fn(path) for path in batch[input_column]]
+        audio_arrays=[]
+        # audio_arrays = [speech_file_to_array_fn(path) for path in batch[input_column]]
+        for path in batch[input_column]:
+            try:
+                # Read the audio file and append the result to audio_arrays
+                audio = speech_file_to_array_fn(path)
+                if not isinstance(audio, (list, np.ndarray)) or len(audio) == 0:
+                    raise ValueError(f"Invalid audio array for file: {path}")
+                audio_arrays.append(audio)
+            except Exception as e:
+                # Log the file name and error if something goes wrong
+                logger.error(f"Error processing file {path}: {e}")
 
         for audio in audio_arrays:
-            # wav = random_subsample(
-            #     audio["array"], max_length=data_args.max_length_seconds, sample_rate=feature_extractor.sampling_rate
-            # )
             wav = random_subsample(
                 audio, max_length=data_args.max_length_seconds, sample_rate=feature_extractor.sampling_rate
             )
             subsampled_wavs.append(wav)
-        inputs = feature_extractor(subsampled_wavs, sampling_rate=feature_extractor.sampling_rate)
+        try:
+            inputs = feature_extractor(subsampled_wavs, sampling_rate=feature_extractor.sampling_rate)
+        except Exception as e:
+            logger.error(f"error batch info : {batch}")
+
         output_batch = {model_input_name: inputs.get(model_input_name)}
         # output_batch["labels"] = list(batch[data_args.label_column_name])
         output_batch["labels"] = [int(label2id[label_name]) for label_name in batch[data_args.label_column_name]]
@@ -337,16 +371,18 @@ def main():
         return output_batch
 
     def val_transforms(batch):
-        """Apply val_transforms across a batch."""
+        """Apply val_transforms across a batch. trim linear part of audio"""
         # wavs = [audio["array"] for audio in batch[data_args.audio_column_name]]
         input_column = "path"
         audio_arrays = [speech_file_to_array_fn(path) for path in batch[input_column]]
         wavs = []
         for audio in audio_arrays:
-            wav = random_subsample(
-                audio, max_length=data_args.max_length_seconds, sample_rate=feature_extractor.sampling_rate
-            )
-            wavs.append(wav)
+            wav_length = len(audio)
+            chunk_length = int(feature_extractor.sampling_rate * data_args.max_length_seconds)
+            if wav_length > chunk_length:
+                wavs.append(audio[:chunk_length])
+            else:
+                wavs.append(audio)
         inputs = feature_extractor(wavs, sampling_rate=feature_extractor.sampling_rate)
         output_batch = {model_input_name: inputs.get(model_input_name)}
         # output_batch["labels"] = list(batch[data_args.label_column_name])
@@ -354,25 +390,21 @@ def main():
 
         return output_batch
 
-    # Prepare label mappings.
-    # We'll include these in the model's config to get human readable labels in the Inference API.
-    # labels = raw_datasets["train"].features[data_args.label_column_name].names
 
     label2id, id2label = {}, {}
     for i, label in enumerate(label_list):
         label2id[label] = str(i)
         id2label[str(i)] = label
 
-    # Load the accuracy metric from the datasets package
-    # metric = evaluate.load("accuracy", cache_dir=model_args.cache_dir)
-    metric = evaluate.combine(["accuracy", "f1", "precision", "recall"])
-
-    # Define our compute_metrics function. It takes an `EvalPrediction` object (a namedtuple with
-    # `predictions` and `label_ids` fields) and has to return a dictionary string to float.
-    def compute_metrics(eval_pred):
-        """Computes accuracy on a batch of predictions"""
-        predictions = np.argmax(eval_pred.predictions, axis=1)
-        return metric.compute(predictions=predictions, references=eval_pred.label_ids)
+    train_labels = raw_datasets["train"][data_args.label_column_name]  # e.g. ["Seoul_Gyeonggi-do", "Jeolla-do", ...]
+    counts = Counter(train_labels)
+    class_weights = get_label_weight(counts, label_list)
+    def myloss(outputs, labels, num_items_in_batch=None):
+        logits = outputs.get('logits')
+        w = class_weights.to(logits.device)
+        closs = CrossEntropyLoss(w)
+        loss = closs(logits, labels)
+        return loss
 
     config = AutoConfig.from_pretrained(
         model_args.config_name or model_args.model_name_or_path,
@@ -402,7 +434,6 @@ def main():
         else:
             model.freeze_feature_encoder()
             
-
     if training_args.do_train:
         if data_args.max_train_samples is not None:
             raw_datasets["train"] = (
@@ -419,17 +450,19 @@ def main():
         # Set the validation transforms
         raw_datasets["eval"].set_transform(val_transforms, output_all_columns=False)
 
-    # Initialize our trainer
+    # Trainer
     trainer = Trainer(
         model=model,
         args=training_args,
         train_dataset=raw_datasets["train"] if training_args.do_train else None,
         eval_dataset=raw_datasets["eval"] if training_args.do_eval else None,
+        compute_loss_func=myloss,
         compute_metrics=compute_metrics,
         processing_class=feature_extractor,
     )
 
     # Training
+    logger.info("### Start train")
     if training_args.do_train:
         checkpoint = None
         if training_args.resume_from_checkpoint is not None:
@@ -442,25 +475,24 @@ def main():
         trainer.save_metrics("train", train_result.metrics)
         trainer.save_state()
 
+        # Write model card and (optionally) push to hub
+        kwargs = {
+            "finetuned_from": model_args.model_name_or_path,
+            "tasks": "audio-classification",
+            "dataset": data_args.dataset_name,
+            "tags": ["audio-classification"],
+        }
+        if training_args.push_to_hub:
+            trainer.push_to_hub(**kwargs)
+            trainer.create_model_card(**kwargs)
+        else:
+            trainer.create_model_card(**kwargs)
+
     # Evaluation
     if training_args.do_eval:
         metrics = trainer.evaluate()
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
-
-    # Write model card and (optionally) push to hub
-    kwargs = {
-        "finetuned_from": model_args.model_name_or_path,
-        "tasks": "audio-classification",
-        "dataset": data_args.dataset_name,
-        "tags": ["audio-classification"],
-    }
-    if training_args.push_to_hub:
-        trainer.push_to_hub(**kwargs)
-        trainer.create_model_card(**kwargs)
-    else:
-        trainer.create_model_card(**kwargs)
-
 
 if __name__ == "__main__":
     main()
